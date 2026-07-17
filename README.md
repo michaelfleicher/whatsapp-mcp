@@ -10,8 +10,6 @@ Here's an example of what you can do when it's connected to Claude.
 
 ![WhatsApp MCP](./example-use.png)
 
-> To get updates on this and other projects I work on [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
-
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
 ## Installation
@@ -122,6 +120,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **mark_chat_as_unread**: Mark a chat as unread so it shows the unread indicator (useful after sending to a chat yourself, since WhatsApp otherwise treats it as read). Syncs to your phone and all linked devices.
+- **mark_chat_as_read**: Mark a chat as read, clearing the unread indicator
 
 ### Media Handling Features
 
