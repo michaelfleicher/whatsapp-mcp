@@ -10,6 +10,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    mark_chat_read as whatsapp_mark_chat_read,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -178,6 +179,57 @@ def send_message(
     
     # Call the whatsapp_send_message function with the unified recipient parameter
     success, status_message = whatsapp_send_message(recipient, message)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def mark_chat_as_unread(chat_jid: str) -> Dict[str, Any]:
+    """Mark a WhatsApp chat as unread so it shows the unread indicator.
+
+    Useful after sending a message to a chat yourself: WhatsApp treats a chat you
+    just sent to as read, so this flags it unread again to draw your attention
+    (e.g. after forwarding leads to a group). The flag syncs to your phone and all
+    linked devices.
+
+    Args:
+        chat_jid: The chat JID (e.g. a group JID like "123456789@g.us" or a
+                  personal chat JID like "123456789@s.whatsapp.net")
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not chat_jid:
+        return {
+            "success": False,
+            "message": "chat_jid must be provided"
+        }
+
+    success, status_message = whatsapp_mark_chat_read(chat_jid, read=False)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def mark_chat_as_read(chat_jid: str) -> Dict[str, Any]:
+    """Mark a WhatsApp chat as read, clearing the unread indicator.
+
+    Args:
+        chat_jid: The chat JID (e.g. a group JID like "123456789@g.us" or a
+                  personal chat JID like "123456789@s.whatsapp.net")
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not chat_jid:
+        return {
+            "success": False,
+            "message": "chat_jid must be provided"
+        }
+
+    success, status_message = whatsapp_mark_chat_read(chat_jid, read=True)
     return {
         "success": success,
         "message": status_message

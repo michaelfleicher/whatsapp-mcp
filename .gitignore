@@ -1,3 +1,43 @@
+# --- WhatsApp session + message stores (NEVER publish) ---
 *.db
-claude_desktop_config.json
+*.db-wal
+*.db-shm
+*.db.bak
+*.db-wal.bak
+*.db-shm.bak
+
+# --- Logs ---
+*.log
 whatsapp.log
+bridge.log
+
+# --- Local connector config (contains machine-specific paths) ---
+claude_desktop_config.json
+
+# --- Daily-leads runtime state & scan artifacts ---
+# Regenerated every run; may contain real message content / group JIDs.
+prior_forwarded.json
+state.json
+candidates*.json
+preflight.status*.json
+diagnostics*.json
+active_groups.json
+fetch_input.json
+group-jids.json
+
+# --- Python caches ---
+__pycache__/
+*.pyc
+.pytest_cache/
+pytest-cache-files-*/
+
+# --- Compiled bridge binary (build artifact; rebuild with `go build`) ---
+whatsapp-bridge/whatsapp-client
+
+# --- Personal automation (kept local, not published) ---
+# launchd job + daily-leads scripts hardcode machine-specific paths / IDs.
+launchd/
+scripts/
+
+# --- OS cruft ---
+.DS_Store

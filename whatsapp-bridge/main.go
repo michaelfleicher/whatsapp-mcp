@@ -23,7 +23,9 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -172,20 +174,86 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// GetLatestMessageInfo returns the newest locally stored message as an anchor for history sync.
+func (store *MessageStore) GetLatestMessageInfo() (*types.MessageInfo, error) {
+	var id, chatJID string
+	var timestamp time.Time
+	var isFromMe bool
+
+	err := store.db.QueryRow(
+		"SELECT id, chat_jid, timestamp, is_from_me FROM messages ORDER BY timestamp DESC LIMIT 1",
+	).Scan(&id, &chatJID, &timestamp, &isFromMe)
+	if err != nil {
+		return nil, err
+	}
+
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("parse chat JID %s: %v", chatJID, err)
+	}
+
+	return &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == "g.us",
+		},
+		ID:        id,
+		Timestamp: timestamp,
+	}, nil
+}
+
+// GetLastMessageForChat returns the id, timestamp and is_from_me flag of the
+// most recent message in the given chat. Used to anchor an app-state
+// mark-read/unread mutation to a concrete message.
+func (store *MessageStore) GetLastMessageForChat(chatJID string) (string, time.Time, bool, error) {
+	var id string
+	var timestamp time.Time
+	var isFromMe bool
+
+	err := store.db.QueryRow(
+		"SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1",
+		chatJID,
+	).Scan(&id, &timestamp, &isFromMe)
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return id, timestamp, isFromMe, nil
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
 
-	// Try to get text content
+	// Try to get plain text content
 	if text := msg.GetConversation(); text != "" {
 		return text
 	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Fall back to captions on media messages (image/video/document),
+	// otherwise a lead posted as "text + attached file" is stored with empty content.
+	if img := msg.GetImageMessage(); img != nil {
+		if c := img.GetCaption(); c != "" {
+			return c
+		}
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		if c := vid.GetCaption(); c != "" {
+			return c
+		}
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		if c := doc.GetCaption(); c != "" {
+			return c
+		}
+	}
+
 	return ""
 }
 
@@ -195,11 +263,154 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
+// HistorySyncResponse represents the response for a history sync request
+type HistorySyncResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// MarkReadRequest represents the request body for the mark-read API.
+// Read=false marks the chat as unread (WhatsApp's "mark as unread" flag).
+type MarkReadRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Read    bool   `json:"read"`
+}
+
+// MarkReadResponse represents the response for the mark-read API
+type MarkReadResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// RecoverAppStateRequest represents the request body for the recover-appstate API.
+// Collection is optional and defaults to "regular_low" (the collection holding
+// mark-read/pin/archive state).
+type RecoverAppStateRequest struct {
+	Collection string `json:"collection,omitempty"`
+}
+
+// RecoverAppStateResponse represents the response for the recover-appstate API
+type RecoverAppStateResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// isAppStateConflict reports whether an error from SendAppState indicates the
+// local app-state cache has drifted from the server and needs a full resync.
+func isAppStateConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "LTHash") ||
+		strings.Contains(msg, "conflict") ||
+		strings.Contains(msg, "409")
+}
+
+// recoverAndRetryAppState self-heals a wedged app-state collection (409 conflict
+// / mismatching LTHash) and re-sends the patch. It first forces a full resync from
+// the server; if that snapshot still can't be verified, it asks the primary device
+// (the phone) for a fresh snapshot and retries after whatsmeow has had a moment to
+// adopt the response. The phone must be online for the recovery-request path to
+// succeed. patch.Type selects the collection to repair (regular_low for mark-read).
+func recoverAndRetryAppState(ctx context.Context, client *whatsmeow.Client, patch appstate.PatchInfo) error {
+	// Attempt 1: force a full resync of the collection, then retry the send.
+	if err := client.FetchAppState(ctx, patch.Type, true, false); err == nil {
+		if err := client.SendAppState(ctx, patch); err == nil {
+			return nil
+		}
+	}
+
+	// Attempt 2: request an app-state recovery snapshot from the primary device.
+	// whatsmeow adopts the response asynchronously, so wait briefly before retrying.
+	recoveryMsg := whatsmeow.BuildAppStateRecoveryRequest(patch.Type)
+	if _, err := client.SendPeerMessage(ctx, recoveryMsg); err != nil {
+		return fmt.Errorf("app-state recovery request failed: %w", err)
+	}
+	time.Sleep(12 * time.Second)
+
+	return client.SendAppState(ctx, patch)
+}
+
+// markChatRead marks a chat as read (read=true) or unread (read=false) by
+// sending a markChatAsRead app-state patch. This propagates to the phone and all
+// linked devices, so the chat shows the unread indicator even when the last
+// message was sent by us.
+func markChatRead(client *whatsmeow.Client, store *MessageStore, chatJID string, read bool) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+
+	// Determine the message-range anchor for the mutation.
+	//
+	// When marking UNREAD we deliberately anchor to "now" rather than the last
+	// message the bridge happens to have stored. The bridge's local message table
+	// can be stale or incomplete for a chat (e.g. only holding an old outgoing
+	// message), and anchoring the unread marker to an old timestamp makes WhatsApp
+	// treat everything after it as already-read, so the unread dot never shows.
+	// Using the current time places the marker at the head of the timeline.
+	//
+	// When marking READ, anchoring to the real last message is correct, so we use
+	// the stored message when available.
+	var lastTimestamp time.Time
+	var lastKey *waCommon.MessageKey
+
+	id, ts, isFromMe, lerr := store.GetLastMessageForChat(chatJID)
+	hasStored := lerr == nil && id != ""
+
+	if read {
+		if hasStored {
+			lastTimestamp = ts
+			lastKey = &waCommon.MessageKey{
+				RemoteJID: proto.String(chatJID),
+				FromMe:    proto.Bool(isFromMe),
+				ID:        proto.String(id),
+			}
+		}
+	} else {
+		// Mark unread: anchor at now. Reuse the stored message key when present so
+		// WhatsApp has a concrete message to attach the marker to, but pair it with
+		// the current timestamp so the marker sits at the top of the chat.
+		lastTimestamp = time.Now()
+		if hasStored {
+			lastKey = &waCommon.MessageKey{
+				RemoteJID: proto.String(chatJID),
+				FromMe:    proto.Bool(isFromMe),
+				ID:        proto.String(id),
+			}
+		}
+	}
+
+	patch := appstate.BuildMarkChatAsRead(jid, read, lastTimestamp, lastKey)
+
+	ctx := context.Background()
+	err = client.SendAppState(ctx, patch)
+	if err != nil && isAppStateConflict(err) {
+		// The local app-state cache has drifted from the server (409 conflict /
+		// mismatching LTHash) and can't reconcile incrementally. Self-heal.
+		err = recoverAndRetryAppState(ctx, client, patch)
+	}
+	if err != nil {
+		return false, fmt.Sprintf("Failed to update chat read state: %v", err)
+	}
+
+	state := "unread"
+	if read {
+		state = "read"
+	}
+	return true, fmt.Sprintf("Chat marked as %s", state)
 }
 
 // Function to send a WhatsApp message
@@ -641,7 +852,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +985,117 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for manually requesting history sync
+	http.HandleFunc("/api/history-sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if err := requestHistorySync(client, messageStore); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(HistorySyncResponse{
+				Success: false,
+				Message: err.Error(),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(HistorySyncResponse{
+			Success: true,
+			Message: "History sync requested. Waiting for server response...",
+		})
+	})
+
+	// Handler for marking a chat as read/unread
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		// Mark the chat as read/unread
+		success, message := markChatRead(client, messageStore, req.ChatJID, req.Read)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		json.NewEncoder(w).Encode(MarkReadResponse{
+			Success: success,
+			Message: message,
+		})
+	})
+
+	// Handler for requesting an app-state recovery snapshot from the primary device.
+	// Use this to repair a collection whose local/server patch chain can no longer
+	// be verified (e.g. "mismatching LTHash" errors from /api/mark-read).
+	http.HandleFunc("/api/recover-appstate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Body is optional; default to regular_low.
+		var req RecoverAppStateRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		collection := appstate.WAPatchRegularLow
+		if req.Collection != "" {
+			collection = appstate.WAPatchName(req.Collection)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(RecoverAppStateResponse{
+				Success: false,
+				Message: "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Ask the primary device (phone) to send an unencrypted snapshot of the
+		// collection. whatsmeow adopts the response automatically when it arrives,
+		// repairing the local app state. This does NOT log out any device.
+		msg := whatsmeow.BuildAppStateRecoveryRequest(collection)
+		if _, err := client.SendPeerMessage(context.Background(), msg); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(RecoverAppStateResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to send recovery request: %v", err),
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(RecoverAppStateResponse{
+			Success: true,
+			Message: fmt.Sprintf("Recovery request sent for %s. Wait ~10s for the primary device to respond, then retry.", collection),
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1122,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -905,6 +1227,12 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	if err := requestHistorySync(client, messageStore); err != nil {
+		logger.Warnf("Failed to request startup history sync: %v", err)
+	} else {
+		logger.Infof("Startup history sync requested")
+	}
+
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
@@ -973,7 +1301,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1316,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1053,14 +1381,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
+				// Extract text content (includes media captions via shared helper)
 				var content string
 				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
+					content = extractTextContent(msg.Message.Message)
 				}
 
 				// Extract media info
@@ -1148,39 +1472,44 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 }
 
 // Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
+func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) error {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
+		return fmt.Errorf("client is not initialized. Cannot request history sync")
+	}
+	if messageStore == nil {
+		return fmt.Errorf("message store is not initialized. Cannot request history sync")
 	}
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
+		return fmt.Errorf("client is not connected. Please ensure you are connected to WhatsApp first")
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
+		return fmt.Errorf("client is not logged in. Please scan the QR code first")
+	}
+
+	lastKnownMessageInfo, err := messageStore.GetLatestMessageInfo()
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("no stored messages available to use as a history sync anchor")
+		}
+		return fmt.Errorf("failed to get history sync anchor message: %v", err)
 	}
 
 	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
+	historyMsg := client.BuildHistorySyncRequest(lastKnownMessageInfo, 100)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
+		return fmt.Errorf("failed to build history sync request")
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
+	_, err = client.SendPeerMessage(context.Background(), historyMsg)
 
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		return fmt.Errorf("failed to request history sync: %v", err)
 	}
+
+	fmt.Println("History sync requested. Waiting for server response...")
+	return nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
